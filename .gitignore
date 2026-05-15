@@ -1,0 +1,6 @@
+*.gif
+*.vtu
+*.vts
+output/*
+*.ogv
+.vscode/*
