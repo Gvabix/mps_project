@@ -1,16 +1,24 @@
 # %% [markdown]
 # # Optimized 3D PyVista Cloud Simulation
-# Fixed axis rotation, pixelated grid background, and visible particle layers.
+# Object-oriented implementation for simulating and visualizing droplet dynamics.
 
 # %%
 import os
 import sys
 import numpy as np
 from tqdm import tqdm
+from typing import List, Dict, Any, Optional
 
 os.environ['NUMBA_THREADING_LAYER'] = 'workqueue'
 
-import pyvista as pv
+if 'google.colab' in sys.modules:
+    import pyvista as pv
+    # xvfb is required for headless rendering in Colab
+    if not os.path.exists('/usr/bin/Xvfb'):
+        os.system('apt-get install -qq xvfb')
+    pv.start_xvfb()
+else:
+    import pyvista as pv
 
 from PySDM_examples.Arabas_et_al_2015 import Settings, SpinUp
 from PySDM_examples.utils.kinematic_2d import Storage, Simulation
@@ -18,235 +26,230 @@ import PySDM.products as PySDM_products
 from PySDM import Formulae
 from PySDM.physics import si
 
-# %% [markdown]
-# ## 1. Simulation Setup
+class DropletSimulation:
+    """
+    A class to handle 3D droplet simulation using PySDM and visualization using PyVista.
+    """
 
-# %%
-FAST_TEST_MODE = True
+    def __init__(
+        self, 
+        grid_size: tuple = (24, 24), 
+        n_sd_per_gridbox: int = 16, 
+        simulation_time: float = 64 * si.minute, 
+        dt: float = 1.0 * si.second
+    ):
+        """
+        Initializes the simulation settings and PySDM objects.
 
-settings = Settings(Formulae())
-
-if FAST_TEST_MODE:
-    print("--- RUNNING IN FAST TEST MODE ---")
-    settings.n_sd_per_gridbox = 8
-    settings.grid = (12, 12)
-    settings.simulation_time = 2 * si.minute
-    settings.dt = 10 * si.second
-else:
-    print("--- RUNNING IN FULL PRODUCTION MODE ---")
-    settings.n_sd_per_gridbox = 16
-    settings.grid = (24, 24)
-    settings.simulation_time = 64 * si.minute
-    settings.dt = 1 * si.second
-
-# Update output_steps to include all time steps
-output_steps = np.arange(0, settings.simulation_time + settings.dt, settings.dt).astype(int)
-
-tracked_products = [PySDM_products.EffectiveRadius(unit='um')]
-storage = Storage()
-sim = Simulation(settings, storage, SpinUp)
-sim.reinit(products=tracked_products)
-
-product_key = list(sim.particulator.products.keys())[0]
-
-# OPTYMALIZACJA: Szukamy kluczy atrybutów RAZ przed uruchomieniem pętli symulacji
-attr_dict = sim.particulator.attributes._ParticleAttributes__attributes
-keys = list(attr_dict.keys())
-pos_key = [k for k in keys if 'pos' in k.lower()][0]
-rad_key = [k for k in keys if 'rad' in k.lower() or 'size' in k.lower()][0]
-
-spatial_frames = []
-time_axis_min = []
-
-# %% [markdown]
-# ## 2. Fast Simulation Loop (Fixed Matrix Shapes)
-
-# %%
-spatial_frames = []
-time_axis_min = []
-
-for step in tqdm(output_steps, desc="Running Physics Engine"):
-    sim.particulator.run(step - sim.particulator.n_steps)
-    
-    # Pobieranie siatki tła
-    grid_data = sim.particulator.products[product_key].get().copy()
-    
-    # Pobieranie obiektów cząstek
-    pos_obj = attr_dict[pos_key].get() if hasattr(attr_dict[pos_key], 'get') else attr_dict[pos_key].storage
-    rad_obj = attr_dict[rad_key].get() if hasattr(attr_dict[rad_key], 'get') else attr_dict[rad_key].storage
-    
-    raw_pos = pos_obj.ndarray.copy() if hasattr(pos_obj, 'ndarray') else np.asarray(pos_obj).copy()
-    raw_r = rad_obj.ndarray.copy() if hasattr(rad_obj, 'ndarray') else np.asarray(rad_obj).copy()
-    
-    if np.max(raw_r) < 1e-2: 
-        raw_r = raw_r * 1e6
+        Args:
+            grid_size: Tuple representing the number of grid boxes (nx, nz).
+            n_sd_per_gridbox: Number of super-droplets per grid box.
+            simulation_time: Total time of the simulation in seconds.
+            dt: Time step in seconds.
+        """
+        self.settings = Settings(Formulae())
+        self.settings.grid = grid_size
+        self.settings.n_sd_per_gridbox = n_sd_per_gridbox
+        self.settings.simulation_time = simulation_time
+        self.settings.dt = dt
         
-    # FIX KSZTAŁTU: Sprawdzamy jak ułożona jest macierz, aby wyciągnąć współrzędne wszystkich N kropel
-    if raw_pos.shape[0] == 2:
-        raw_x = raw_pos[0]
-        raw_z = raw_pos[1]
-    else:
-        raw_x = raw_pos[:, 0]
-        raw_z = raw_pos[:, 1]
+        # Calculate output steps based on simulation time and dt
+        self.output_steps = np.arange(0, self.settings.simulation_time + self.settings.dt, self.settings.dt).astype(int)
         
-    raw_r = raw_r.flatten()
-    
-    # DIAGNOSTYKA: Sprawdzenie zakresu współrzędnych w pierwszej klatce
-    if step == output_steps[0]:
-        print(f"Domain size: {settings.size}")
-        print(f"Raw X range: [{raw_x.min():.6f}, {raw_x.max():.6f}]")
-        print(f"Raw Z range: [{raw_z.min():.6f}, {raw_z.max():.6f}]")
-        print(f"Number of particles: {len(raw_x)}")
-    
-    # Tworzenie właściwej macierzy 3D dla WSZYSTKICH cząstek
-    # Transpose mapping: swap axes so visualization matches data orientation
-    particle_coords = np.zeros((len(raw_x), 3))
-    particle_coords[:, 0] = raw_z * settings.size[0]  # map raw_z -> X
-    particle_coords[:, 1] = 0.1
-    particle_coords[:, 2] = raw_x * settings.size[1]  # map raw_x -> Z
-    
-    spatial_frames.append({
-        'grid': grid_data,
-        'coords': particle_coords,
-        'radii': raw_r
-    })
+        self.tracked_products = [PySDM_products.EffectiveRadius(unit='um')]
+        self.storage = Storage()
+        self.sim = Simulation(self.settings, self.storage, SpinUp)
+        self.sim.reinit(products=self.tracked_products)
+        
+        self.product_key = list(self.sim.particulator.products.keys())[0]
+        
+        # Cache attribute keys for faster access during simulation
+        attr_dict = self.sim.particulator.attributes._ParticleAttributes__attributes
+        self.attr_keys = {
+            'pos': [k for k in attr_dict.keys() if 'pos' in k.lower()][0],
+            'rad': [k for k in attr_dict.keys() if 'rad' in k.lower() or 'size' in k.lower()][0]
+        }
+        
+        self.spatial_frames: List[Dict[str, np.ndarray]] = []
+
+    def run(self) -> List[Dict[str, np.ndarray]]:
+        """
+        Runs the physics engine and stores spatial frames for visualization.
+
+        Returns:
+            A list of dictionaries, each containing grid data, particle coordinates, and radii.
+        """
+        self.spatial_frames = []
+        attr_dict = self.sim.particulator.attributes._ParticleAttributes__attributes
+        
+        for step in tqdm(self.output_steps, desc="Running Physics Engine"):
+            self.sim.particulator.run(step - self.sim.particulator.n_steps)
+            
+            # Extract grid data
+            grid_data = self.sim.particulator.products[self.product_key].get().copy()
+            
+            # Extract particle attributes
+            pos_obj = attr_dict[self.attr_keys['pos']]
+            rad_obj = attr_dict[self.attr_keys['rad']]
+            
+            pos_data = pos_obj.get() if hasattr(pos_obj, 'get') else pos_obj.storage
+            rad_data = rad_obj.get() if hasattr(rad_obj, 'get') else rad_obj.storage
+            
+            raw_pos = pos_data.ndarray.copy() if hasattr(pos_data, 'ndarray') else np.asarray(pos_data).copy()
+            raw_r = rad_data.ndarray.copy() if hasattr(rad_data, 'ndarray') else np.asarray(rad_data).copy()
+            
+            # Unit conversion if necessary (m to um)
+            if np.max(raw_r) < 1e-2: 
+                raw_r = raw_r * 1e6
+                
+            # Handle coordinate mapping
+            if raw_pos.shape[0] == 2:
+                raw_x, raw_z = raw_pos[0], raw_pos[1]
+            else:
+                raw_x, raw_z = raw_pos[:, 0], raw_pos[:, 1]
+                
+            raw_r = raw_r.flatten()
+            
+            # Map coordinates to 3D space for PyVista (Z -> X, X -> Z)
+            particle_coords = np.zeros((len(raw_x), 3))
+            particle_coords[:, 0] = raw_z * self.settings.size[0]
+            particle_coords[:, 1] = 0.1
+            particle_coords[:, 2] = raw_x * self.settings.size[1]
+            
+            self.spatial_frames.append({
+                'grid': grid_data,
+                'coords': particle_coords,
+                'radii': raw_r
+            })
+            
+        return self.spatial_frames
+
+    def generate_gif(self, filename: str = 'droplet_simulation.gif', fps: int = 10, render_every: int = 1) -> None:
+        """
+        Renders the simulation results and saves them as a GIF.
+
+        Args:
+            filename: The name of the output GIF file.
+            fps: Frames per second for the animation.
+            render_every: Number of steps to skip between rendered frames.
+        """
+        if not self.spatial_frames:
+            print("No simulation data found. Please run the simulation first.")
+            return
+
+        # Pre-calculate color limits for consistent colormap across all frames
+        grid_vals = np.hstack([f['grid'].T.flatten() for f in self.spatial_frames]).astype(float)
+        p2, p98 = np.nanpercentile(grid_vals, [2, 98])
+        
+        if not np.isfinite(p2) or not np.isfinite(p98) or p98 <= p2:
+            grid_min, grid_max = np.nanmin(grid_vals), np.nanmax(grid_vals)
+            if grid_min == grid_max:
+                grid_max += 1.0
+        else:
+            grid_min, grid_max = float(p2), float(p98)
+
+        # Setup Plotter
+        plotter = pv.Plotter(notebook=True, off_screen=True, window_size=(1200, 800))
+        plotter.set_background('white')
+        plotter.disable_anti_aliasing()
+        plotter.enable_depth_peeling()
+
+        # Initialize Background Grid Mesh
+        grid_mesh = pv.ImageData(dimensions=(self.settings.grid[0] + 1, 1, self.settings.grid[1] + 1))
+        grid_mesh.spacing = (self.settings.size[0] / self.settings.grid[0], 1, self.settings.size[1] / self.settings.grid[1])
+        grid_mesh.cell_data["Grid Radius"] = np.array(self.spatial_frames[0]['grid'].T.flatten(order="C"), dtype=float)
+
+        plotter.add_mesh(
+            grid_mesh,
+            scalars="Grid Radius",
+            cmap="viridis",
+            clim=[grid_min, grid_max],
+            opacity=0.5,
+            show_scalar_bar=True,
+            lighting=False,
+            scalar_bar_args={
+                "title": "Grid Radius [um]",
+                "color": "black",
+                "position_x": 0.02,
+                "position_y": 0.12,
+                "width": 0.08,
+                "height": 0.18,
+                "title_font_size": 10,
+                "label_font_size": 8,
+            },
+        )
+
+        # Initialize Point Cloud and Glyphs
+        init_frame = self.spatial_frames[0]
+        point_cloud = pv.PolyData(init_frame['coords'])
+        point_cloud["Display Size"] = init_frame['radii'] * 0.3 + 2.0
+        
+        droplet_geom = pv.Sphere(phi_resolution=16, theta_resolution=16)
+        droplet_glyphs = point_cloud.glyph(scale="Display Size", factor=1.0, geom=droplet_geom)
+
+        particle_actor = plotter.add_mesh(
+            droplet_glyphs,
+            color="red",
+            lighting=False,
+            ambient=1.0,
+        )
+
+        # Domain boundary
+        domain_box = pv.Box(bounds=(0, self.settings.size[0], 0, 0.2, 0, self.settings.size[1]))
+        plotter.add_mesh(domain_box, color="black", style="wireframe", opacity=0.2)
+
+        # Camera Configuration
+        plotter.view_xz()
+        plotter.camera.SetParallelProjection(True)
+        plotter.reset_camera()
+
+        time_text = plotter.add_text("t = 0.0 min", position=(10, 760), font_size=14, color="black")
+
+        # Compile Animation
+        plotter.open_gif(filename, fps=fps)
+
+        for step, frame in zip(self.output_steps, tqdm(self.spatial_frames, desc="Generating GIF")):
+            if step % render_every != 0:
+                continue
+
+            grid_mesh.cell_data["Grid Radius"] = np.array(frame['grid'].T.flatten(order="C"), dtype=float)
+            
+            point_cloud.points = frame['coords']
+            point_cloud["Display Size"] = frame['radii'] * 0.3 + 2.0
+            
+            updated_glyphs = point_cloud.glyph(scale="Display Size", factor=1.0, geom=droplet_geom)
+            particle_actor.mapper.dataset = updated_glyphs
+            
+            time_text.SetInput(f"t = {step / si.minute:.1f} min")
+            
+            plotter.render()
+            plotter.write_frame()
+
+        plotter.close()
+        print(f"Animation saved to {filename}")
 
 # %% [markdown]
-# ## 3. Render Setup: Fixed legends, uniform droplets, correct orientation
+# ## Execution Example
 
 # %%
-# Diagnostyka: Sprawdzenie zakresu współrzędnych przed renderowaniem
-all_coords = np.vstack([f['coords'] for f in spatial_frames])
-print(f"\nAll particles X range: [{all_coords[:, 0].min():.2f}, {all_coords[:, 0].max():.2f}]")
-print(f"All particles Z range: [{all_coords[:, 2].min():.2f}, {all_coords[:, 2].max():.2f}]")
-print(f"Grid bounds should be: X[0, {settings.size[0]}], Z[0, {settings.size[1]}]")
-
-# compute fixed color limits for grid across whole simulation (transpose grid values)
-grid_vals = np.hstack([f['grid'].T.flatten(order='C').astype(float) for f in spatial_frames])
-# diagnostics
-print(f"Grid values: min={np.nanmin(grid_vals):.6g}, max={np.nanmax(grid_vals):.6g}, mean={np.nanmean(grid_vals):.6g}, std={np.nanstd(grid_vals):.6g}")
-print(f"Grid unique count (sampled up to 10): {np.unique(grid_vals)[:10]} (total unique {len(np.unique(grid_vals))})")
-
-# robust percentiles to avoid single-frame domination
-p2, p98 = np.nanpercentile(grid_vals, [2, 98])
-print(f"Grid percentiles: 2%={p2:.6g}, 98%={p98:.6g}")
-
-# Determine effective clim with safe fallback
-if not np.isfinite(p2) or not np.isfinite(p98) or p98 <= p2:
-    gmin = float(np.nanmin(grid_vals))
-    gmax = float(np.nanmax(grid_vals))
-    if gmax == gmin:
-        # expand a bit so colormap has range
-        eps = 1.0 if abs(gmin) < 1e-8 else abs(gmin) * 0.01
-        grid_min, grid_max = gmin - eps, gmax + eps
-    else:
-        grid_min, grid_max = gmin, gmax
-else:
-    grid_min, grid_max = float(p2), float(p98)
-
-print(f"Using grid clim: [{grid_min:.6g}, {grid_max:.6g}]")
-
-global_max_radius = float(max(np.max(f['radii']) for f in spatial_frames))
-
-plotter = pv.Plotter(notebook=True, off_screen=True, window_size=(1200, 800))
-plotter.set_background('white')
-plotter.disable_anti_aliasing()
-plotter.enable_depth_peeling()
-
-# Konfiguracja ostrych komórek siatki tła (fixed clim)
-# Note: transpose grid when assigning to mesh so axes match particle mapping
-grid_mesh = pv.ImageData(dimensions=(settings.grid[0] + 1, 1, settings.grid[1] + 1))
-grid_mesh.spacing = (settings.size[0] / settings.grid[0], 1, settings.size[1] / settings.grid[1])
-# ensure float array
-grid_mesh.cell_data["Grid Radius"] = np.array(spatial_frames[0]['grid'].T.flatten(order="C"), dtype=float)
-
-# Add grid with fixed clim and a subtle scalar bar
-grid_actor = plotter.add_mesh(
-    grid_mesh,
-    scalars="Grid Radius",
-    cmap="viridis",
-    clim=[grid_min, grid_max],
-    opacity=0.5,
-    show_scalar_bar=True,
-    lighting=False,
-    scalar_bar_args={
-        "title": "Grid Radius [um]",
-        "color": "black",
-        "position_x": 0.02,
-        "position_y": 0.12,
-        "width": 0.08,
-        "height": 0.18,
-        "title_font_size": 10,
-        "label_font_size": 8,
-    },
-)
-
-# Konfiguracja chmury kropel - uniform red color, size encodes radius
-init_coords = spatial_frames[0]['coords']
-init_radii = spatial_frames[0]['radii']
-
-point_cloud = pv.PolyData(init_coords)
-point_cloud["Display Size"] = init_radii * 0.3 + 2.0
-point_cloud["Real Radius"] = init_radii
-
-# generate glyphs
-# lighting=False reduces bright white highlights that make colors look different
-# increased resolution to 16x16 for smoother look
-droplet_spheres = point_cloud.glyph(scale="Display Size", factor=1.0, geom=pv.Sphere(phi_resolution=16, theta_resolution=16))
-
-particle_actor = plotter.add_mesh(
-    droplet_spheres,
-    color="red",  # uniform red
-    show_scalar_bar=False,
-    lighting=False,
-    ambient=1.0,
-)
-
-# Czarne, subtelne obramowanie domeny
-domain_box = pv.Box(bounds=(0, settings.size[0], 0, 0.2, 0, settings.size[1]))
-plotter.add_mesh(domain_box, color="black", style="wireframe", opacity=0.2)
-
-# Ustawienie kamery - use view_xz without extra azimuth rotation
-plotter.view_xz()
-plotter.camera.SetParallelProjection(True)
-plotter.reset_camera()
-
-# Aktualny czas symulacji - top-left
-if spatial_frames:
-    time_text = plotter.add_text("t = 0.0 min", position=(10, 760), font_size=14, color="black")
-else:
-    time_text = None
-
-# %% [markdown]
-# ## 4. Compile Dynamic Animation
-
-# %%
-gif_filename = 'super_droplets_cloud_perfect.gif'
-plotter.open_gif(gif_filename, fps=10)
-
-for step, frame in zip(output_steps, tqdm(spatial_frames, desc="Compiling Final Masterpiece")):
-    # Aktualizacja danych siatki (ostre piksele) - grid uses fixed clim
-    grid_mesh.cell_data["Grid Radius"] = np.array(frame['grid'].T.flatten(order="C"), dtype=float)
+if __name__ == "__main__":
+    # Create simulation instance with custom parameters
+    sim_runner = DropletSimulation(
+        grid_size=(16, 16),
+        n_sd_per_gridbox = 8,
+        simulation_time = 32 * si.minute,
+        dt = 5.0 * si.second
+    )
     
-    # Aktualizacja współrzędnych i promieni wszystkich kropel chmury
-    point_cloud.points = frame['coords']
-    point_cloud["Display Size"] = frame['radii'] * 0.3 + 2.0
-    point_cloud["Real Radius"] = frame['radii']
+    # Run simulation
+    sim_runner.run()
     
-    # Ponowne przeliczenie siatki trójwymiarowych kulek
-    updated_spheres = point_cloud.glyph(scale="Display Size", factor=1.0, geom=pv.Sphere(phi_resolution=16, theta_resolution=16))
-    
-    # Przekazanie struktury do pamięci karty graficznej
-    particle_actor.mapper.dataset = updated_spheres
-    
-    if time_text is not None:
-        time_text.SetInput(f"t = {step / si.minute:.1f} min")
-    
-    plotter.render()
-    plotter.write_frame()
+    # Generate visualization
+    sim_runner.generate_gif(filename='cloud_simulation_refactored.gif', fps=10, render_every=12)
 
-plotter.close()
-
-# Wyświetlenie gotowego, pięknego gifa
-from IPython.display import Image, display
-display(Image(filename=gif_filename))
+    # Display in notebook if applicable
+    try:
+        from IPython.display import Image, display
+        display(Image(filename='cloud_simulation_refactored.gif'))
+    except ImportError:
+        pass
