@@ -4,3 +4,4 @@
 output/*
 *.ogv
 .vscode/*
+__ptx_cache__.db
